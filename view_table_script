@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""
+Export CREATE TABLE statements for all Iceberg tables
+registered in Hive Metastore.
+"""
+
+from pyspark.sql import SparkSession
+from datetime import datetime
+import os
+
+# -------------------------------------------------------------------
+# Configuration
+# -------------------------------------------------------------------
+OUTPUT_DIR = "/tmp/iceberg_ddls"
+INCLUDE_ONLY_ICEBERG = True  # set False to export all tables
+
+# -------------------------------------------------------------------
+# Spark session
+# -------------------------------------------------------------------
+spark = (
+    SparkSession.builder
+    .appName("ExportIcebergDDLs")
+    .enableHiveSupport()
+    .getOrCreate()
+)
+
+spark.sql("SET spark.sql.catalogImplementation=hive")
+
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+def is_iceberg_table(full_table_name: str) -> bool:
+    """
+    Detect whether a table is an Iceberg table
+    """
+    rows = spark.sql(f"DESCRIBE EXTENDED {full_table_name}").collect()
+    return any(
+        "iceberg" in (row.col_name or "").lower()
+        or "iceberg" in (row.data_type or "").lower()
+        for row in rows
+    )
+
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+output_file = os.path.join(
+    OUTPUT_DIR, f"iceberg_create_tables_{timestamp}.sql"
+)
+
+ddls = []
+
+databases = [row.databaseName for row in spark.sql("SHOW DATABASES").collect()]
+
+for db in databases:
+    spark.sql(f"USE {db}")
+
+    tables = spark.sql("SHOW TABLES").collect()
+
+    for t in tables:
+        if t.isTemporary:
+            continue
+
+        full_table_name = f"{db}.{t.tableName}"
+
+        try:
+            if INCLUDE_ONLY_ICEBERG and not is_iceberg_table(full_table_name):
+                continue
+
+            ddl = spark.sql(
+                f"SHOW CREATE TABLE {full_table_name}"
+            ).collect()[0][0]
+
+            ddls.append(
+                f"-- ==================================================\n"
+                f"-- {full_table_name}\n"
+                f"-- ==================================================\n"
+                f"{ddl};\n\n"
+            )
+
+            print(f"[OK] {full_table_name}")
+
+        except Exception as e:
+            print(f"[SKIP] {full_table_name} -> {e}")
+
+# -------------------------------------------------------------------
+# Write output
+# -------------------------------------------------------------------
+with open(output_file, "w", encoding="utf-8") as f:
+    f.writelines(ddls)
+
+print(f"\n✔ Export completed")
+print(f"✔ File written to: {output_file}")
+
+spark.stop()
