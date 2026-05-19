@@ -1,19 +1,19 @@
 # CatalystCore
 
-A lightweight PySpark framework for orchestrating SQL transformations in a defined execution order.
+A modular PySpark framework for orchestrating SQL-based data pipelines, built around metadata-driven processing of medallion-layered data models.
 
-CatalystCore runs SparkSQL files according to a JSON-based DAG specification, letting you express data pipelines as plain SQL with their dependencies declared as metadata. The framework handles Spark session management, execution order, logging, and error propagation — you focus on the SQL.
+CatalystCore reads JSON metadata describing your data model, resolves a DAG of SQL transformations, and executes them on Spark. Each concern — Spark session management, DAG resolution, ingestion, silver-layer processing, exception handling, sink writing — is isolated in its own module, so the framework scales from a single table to thousands without changing orchestration code.
 
 ---
 
 ## Features
 
-- **SQL-first** — write transformations as `.sql` files; no PySpark boilerplate per step
-- **Metadata-driven DAGs** — declare execution order and dependencies in JSON, not in code
-- **Multi-app support** — group related pipelines under `apps/`, each with its own DAG
-- **Centralised configuration** — Spark, source, and target settings live in `config/`
-- **Structured logging** — every run produces traceable logs under `logs/`
-- **Single entry point** — launch any pipeline via `main.py`
+- **Metadata-driven** — data models, dependencies, and execution plans live in JSON under `metadata/`
+- **Medallion-aware** — first-class support for ingestion (`i_phase`), historisation (`h_phase`), and gold (`gold_*`) layers
+- **Modular managers** — Spark, DAG, ingestion, logging, exceptions, and sinks are each their own component
+- **Multi-tenant by design** — data models are scoped by country and entity (e.g. `Maroc/SAHAM_BANK/`)
+- **Reprise / recovery** — built-in replay of failed runs via `reprise_silver.py`
+- **Multiple execution modes** — full DAG, single unit, or nested-folder traversal
 
 ---
 
@@ -21,16 +21,41 @@ CatalystCore runs SparkSQL files according to a JSON-based DAG specification, le
 
 ```
 catalystcore/
-├── apps/             # SQL files grouped by application/pipeline
-│   └── <app_name>/
-│       ├── step_01.sql
-│       ├── step_02.sql
-│       └── ...
-├── config/           # Spark and environment configuration
-├── logs/             # Runtime logs (gitignored except .gitkeep)
-├── metadata/         # JSON DAG definitions per app
-│   └── <app_name>.json
-├── main.py           # Framework entry point
+├── apps/
+│   └── SPM/                              # Silver Processing Manager
+│       └── src/
+│           ├── context_manager/          # Run context & parameters
+│           ├── dag_manager/              # DAG resolution & topological execution
+│           ├── exception_manager/        # Error classification & propagation
+│           ├── ingestion/                # Source ingestion logic
+│           ├── logger/                   # Structured logging utilities
+│           ├── silver_manager/           # Silver-layer transformations
+│           ├── sink_writer/              # Iceberg / Hive / target writers
+│           ├── spark_manager/            # Spark session lifecycle
+│           ├── utils/                    # Shared helpers
+│           ├── Executor.py               # Generic executor
+│           ├── Executor_nested_folders.py# Traversal of nested metadata
+│           ├── Main_Silver_Manager.py    # Full silver run entry point
+│           ├── Main_Silver_Unit.py       # Single-unit silver run entry point
+│           └── reprise_silver.py         # Replay / recovery entry point
+│
+├── config/
+│   └── shared_config.json                # Cross-app configuration
+│
+├── logs/
+│   ├── execution/                        # Per-run execution logs
+│   ├── Exception_silver.Log              # Silver-layer exceptions
+│   └── exceptions.log                    # Global exception log
+│
+├── metadata/
+│   └── data_models/
+│       └── models/
+│           └── <country>/                # e.g. Maroc
+│               └── <entity>/             # e.g. SAHAM_BANK
+│                   ├── gold_<domain>/    # Gold layer (compliance, finance, risk, …)
+│                   ├── h_phase[_<v>]/    # Historisation phase
+│                   └── i_phase[_<v>]/    # Ingestion / extraction phase
+│
 └── README.md
 ```
 
@@ -38,35 +63,44 @@ catalystcore/
 
 ## Architecture
 
+```mermaid
+flowchart TD
+    A[Main_Silver_* entry point] --> B[context_manager]
+    A --> C[spark_manager]
+    B --> D[dag_manager]
+    C --> D
+    D --> E[ingestion / silver_manager]
+    E --> F[sink_writer]
+    F --> G[(Target: Iceberg / Hive)]
+    E -.->|errors| H[exception_manager]
+    E -.->|events| I[logger]
+    H --> J[logs/Exception_silver.Log]
+    I --> K[logs/execution/]
 ```
-        ┌──────────────┐
-        │   main.py    │   ← entry point
-        └──────┬───────┘
-               │
-   ┌───────────┴───────────┐
-   ▼                       ▼
-┌─────────┐         ┌────────────┐
-│ config/ │         │ metadata/  │
-│ (Spark, │         │ (JSON DAG) │
-│  envs)  │         │            │
-└────┬────┘         └─────┬──────┘
-     │                    │
-     └──────────┬─────────┘
-                ▼
-        ┌───────────────┐
-        │  DAG Runner   │   ← resolves dependencies,
-        │               │     executes SQL in order
-        └───────┬───────┘
-                ▼
-        ┌───────────────┐
-        │  apps/<app>/  │
-        │   *.sql       │
-        └───────┬───────┘
-                ▼
-        ┌───────────────┐
-        │ Spark Session │
-        └───────────────┘
+
+Each `Main_*` entry point wires the managers together: `context_manager` resolves run parameters, `spark_manager` opens the Spark session, `dag_manager` builds the execution graph from `metadata/`, and the silver/ingestion managers apply SQL transformations. Outputs flow through `sink_writer`; failures are captured by `exception_manager` and persisted by `logger`.
+
+---
+
+## Data Model Conventions
+
+Each table lives under:
+
 ```
+metadata/data_models/models/<country>/<entity>/<table_name>/
+```
+
+Table-name prefixes carry meaning:
+
+| Prefix    | Layer / Role                                | Example                     |
+|-----------|---------------------------------------------|-----------------------------|
+| `i_phase` | Ingestion / extraction (raw → silver)       | `i_phase_AS2`               |
+| `h_phase` | Historisation (SCD Type 2)                  | `h_phase_AS3`               |
+| `gold_*`  | Gold layer, organised by business domain    | `gold_finance`, `gold_risk` |
+
+Suffixes:
+- `_tmp` — temporary / intermediate tables
+- `_AS`, `_AS2`, `_AS3` — variants for alternate scenarios
 
 ---
 
@@ -74,7 +108,8 @@ catalystcore/
 
 - Python 3.9+
 - Apache Spark 3.4+
-- Access to your target catalogue (Hive Metastore, Iceberg, etc.)
+- Access to a Hive Metastore and/or Iceberg catalogue
+- Credentials for the source systems referenced in `metadata/`
 
 ---
 
@@ -90,96 +125,89 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Spark and runtime configuration lives in `config/`. At a minimum you'll define:
+Global runtime parameters live in `config/shared_config.json`:
 
-- Spark master, executor resources, and packages
-- Catalogue / metastore endpoints
-- Source and target connection details
-- Environment profiles (e.g. `dev`, `prod`)
+- Spark session settings (master, executor resources, packages)
+- Catalogue and metastore endpoints
+- Source / target connection details
+- Logging and exception-handling defaults
 
-See the example files in `config/` for the full list of supported options.
-
----
-
-## Defining a Pipeline
-
-A pipeline is a JSON file in `metadata/` that lists SQL steps and their dependencies.
-
-**Example — `metadata/sales_reporting.json`:**
-
-```json
-{
-  "app": "sales_reporting",
-  "description": "Daily refresh of the sales reporting layer",
-  "nodes": [
-    {
-      "id": "stg_orders",
-      "sql_file": "stg_orders.sql",
-      "depends_on": []
-    },
-    {
-      "id": "stg_customers",
-      "sql_file": "stg_customers.sql",
-      "depends_on": []
-    },
-    {
-      "id": "fact_orders",
-      "sql_file": "fact_orders.sql",
-      "depends_on": ["stg_orders", "stg_customers"]
-    }
-  ]
-}
-```
-
-Each `sql_file` is resolved relative to `apps/<app>/`. The DAG runner executes nodes in topological order; independent nodes (e.g. `stg_orders` and `stg_customers`) can be run in parallel if enabled in `config/`.
+Per-table parameters (schema, partitioning, SQL, dependencies) live in each table's folder under `metadata/data_models/models/<country>/<entity>/<table>/`.
 
 ---
 
 ## Running a Pipeline
 
+### Full silver-layer run (managed DAG over all tables)
+
 ```bash
-python main.py --app sales_reporting
+python apps/SPM/src/Main_Silver_Manager.py
 ```
 
-**Common options:**
+### Single-unit run (one table / one phase)
 
-| Flag        | Description                                                |
-|-------------|------------------------------------------------------------|
-| `--app`     | Name of the app to run (must match a file in `metadata/`)  |
-| `--env`     | Environment profile from `config/` (e.g. `dev`, `prod`)    |
-| `--dry-run` | Resolve and print the DAG without executing                |
+```bash
+python apps/SPM/src/Main_Silver_Unit.py --table <table_name>
+```
 
-> Adjust the flags above to match the actual CLI exposed by `main.py`.
+### Reprise / recovery of a failed run
+
+```bash
+python apps/SPM/src/reprise_silver.py --run-id <run_id>
+```
+
+### Generic / nested executors
+
+```bash
+python apps/SPM/src/Executor.py
+python apps/SPM/src/Executor_nested_folders.py
+```
+
+> Replace the placeholder flags with the actual CLI signatures of each script.
 
 ---
 
 ## Logging
 
-Each run writes logs to `logs/<app>/<run_id>/`, containing:
+All runs write to `logs/`:
 
-- The resolved DAG
-- Per-step start/end timestamps and row counts
-- Stack traces on failure
+- **`logs/execution/`** — per-run execution traces (DAG resolution, step timings, row counts)
+- **`logs/Exception_silver.Log`** — silver-layer exceptions
+- **`logs/exceptions.log`** — global exceptions across all components
 
-Logs are written locally; forward them to your central logging stack if needed.
+Exceptions are classified by `exception_manager/` before being logged, so downstream alerting can filter by severity and component.
+
+---
+
+## Adding a New Table
+
+1. Create the metadata folder:
+   ```
+   metadata/data_models/models/<country>/<entity>/<new_table>/
+   ```
+2. Add the table's JSON spec (schema, source, SQL, dependencies) inside that folder
+3. Validate locally with:
+   ```bash
+   python apps/SPM/src/Main_Silver_Unit.py --table <new_table>
+   ```
+4. Once green, the next full run picks it up automatically
 
 ---
 
 ## Development
 
-To add a new pipeline:
+- Modules under `apps/SPM/src/` follow a manager pattern: each handles one concern and exposes a small public API
+- New processing layers (e.g. a future `GPM` for gold, `IPM` for ingestion) should sit alongside `SPM` under `apps/`
+- Lint your SparkSQL with [`sparksql-lint`](#) before committing (recommended pre-commit hook)
 
-1. Create `apps/<your_app>/` and drop your `.sql` files there
-2. Create `metadata/<your_app>.json` describing the DAG
-3. Run with `python main.py --app <your_app>`
-4. Inspect logs under `logs/<your_app>/`
+---
 
-### SQL conventions
+## Roadmap
 
-- One transformation per file — keep each step focused
-- Use Spark SQL syntax compatible with the project's Spark version
-- Reference upstream tables by their target name; CatalystCore guarantees they exist before a dependent step runs
-- Lint your SQL with [`sparksql-lint`](#) before committing (recommended pre-commit hook)
+- [ ] Parallel execution of independent DAG branches
+- [ ] Web UI for DAG visualisation
+- [ ] Native Airflow operator (`CatalystCoreOperator`)
+- [ ] Dedicated `GPM` (Gold Processing Manager) app
 
 ---
 
